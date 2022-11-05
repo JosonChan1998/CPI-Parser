@@ -43,8 +43,8 @@ Make sure to put the files as the following structure:
 
 |  Backbone    |  LR  | mIOU | APvol | AP_p50 | PCP50 | download |
 |--------------|:----:|:----:|:-----:|:------:|:-----:|:--------:|
-|  R-50        |  3x  | 59.0 | 58.4  |  72.2  |  67.8 |[model]() |
-|  ConvNext-B  |  3x  | 66.5 | 63.1  |  80.9  |  74.6 |[model]() |
+|  R-50        |  3x  | 59.0 | 58.4  |  72.2  |  67.8 |[model](https://drive.google.com/file/d/1uiqPVZNWIEIKquMNhZ7tv3OTZrc9WGt0/view?usp=share_link) |
+|  ConvNext-B  |  3x  | 66.5 | 63.1  |  80.9  |  74.6 |[model](https://drive.google.com/file/d/117grkZS6Q-v5tbeTLdyENSI0fSRD09lK/view?usp=sharing) |
 
 ### MHP
 

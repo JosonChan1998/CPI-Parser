@@ -60,7 +60,7 @@ model=dict(
         parse_start_level=0
     ),
     test_cfg=dict(
-        score_thr=0.05,
+        score_thr=0.01,
         save_root='work_dirs/causal_parser_r50_inter_8_135k_cihp'
     ))
 
