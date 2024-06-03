@@ -39,7 +39,7 @@ class CausalParser(DeformableDETRParser):
         if 'aug_img' in kwargs.keys():
             img = torch.cat([img, kwargs['aug_img']], dim=0)
             bs = img.shape[0]
-            img_metas = [img_metas[0] for _ in range(bs)]
+            img_metas = [img_metas[i % (bs//2)] for i in range(bs)]
 
         super(SingleStageDetector, self).forward_train(img, img_metas)
         x = self.extract_feat(img)

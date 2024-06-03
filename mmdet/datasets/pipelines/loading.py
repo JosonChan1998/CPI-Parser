@@ -268,6 +268,63 @@ class LoadFourierImageFromFile(LoadImageFromFile):
 
 
 @PIPELINES.register_module()
+class LoadMaskImageFromFile(LoadFourierImageFromFile):
+    def __init__(self,
+                 *arg,
+                 use_mask=True,
+                 mask_parts=[i for i in range(1, 20)],
+                 part_prob=[0.022, 0.129, 0.005, 0.005, 0.111,
+                            0.012, 0.050, 0.009, 0.078, 0.120,
+                            0.004, 0.005, 0.136, 0.091, 0.094,
+                            0.023, 0.023, 0.038, 0.038],
+                 **kwargs):
+        super().__init__(*arg, **kwargs)
+        self.use_mask = use_mask
+        self.mask_parts = mask_parts
+        self.part_prob = part_prob
+        self.part_prob = [i / sum(self.part_prob) for i in self.part_prob]
+        # self.part_prob = [0.27, 0.281, 0.148, 0.151]
+        # self.part_prob = [i / sum(self.part_prob) for i in self.part_prob]
+    
+    def __call__(self, results):
+        results = super().__call__(results)
+        results['mask_parts'] = np.array(1000).reshape(1, 1) # temp for valid number
+        if (self.use_mask == True) and (np.random.randint(2) == 1):
+            if results['img_prefix'] is not None:
+                filename = osp.join(results['img_prefix'],
+                                    results['img_info']['filename'])
+            else:
+                filename = results['img_info']['filename']
+
+            seg_filename = filename.replace('train_img', 'train_seg')
+            seg_filename = seg_filename.replace('.jpg', '.png')
+            img_bytes = self.file_client.get(seg_filename)
+            val_seg = mmcv.imfrombytes(
+                img_bytes, flag='unchanged').squeeze()
+
+            for i in range(10):
+                # choice = [i for i in range(4)]
+                # index = np.random.choice(choice, p=self.part_prob)
+                # mask_part = self.mask_parts[index]
+                # valid_mask = np.ones(val_seg.shape[:2], np.bool8)[..., None]
+                # for part in mask_part:
+                #     valid_mask = valid_mask * (~((val_seg == part)).astype(np.bool8)[..., None])
+                # if valid_mask.min() == False:
+                #     results['aug_img'] = results['img'] * valid_mask
+                #     results['mask_parts'] = np.array(mask_part) -1
+                #     break
+
+                mask_part = np.random.choice(self.mask_parts, p=self.part_prob)
+                valid_mask = ~((val_seg == mask_part)).astype(np.bool8)[..., None]
+                if valid_mask.min() == False:
+                    results['aug_img'] = results['img'] * valid_mask
+                    results['mask_parts'] = np.array(mask_part) -1
+                    break
+
+        return results
+
+
+@PIPELINES.register_module()
 class LoadImageFromWebcam(LoadImageFromFile):
     """Load an image from webcam.
 

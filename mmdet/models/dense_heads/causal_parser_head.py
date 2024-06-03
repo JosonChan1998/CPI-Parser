@@ -107,7 +107,74 @@ class CausalParserHead(DeformableDETRParserHead):
              gt_bboxes_ignore=None,
              **kwargs):
 
-        pass
+        gt_semantic_seg = kwargs['gt_semantic_seg']
+        gt_parsings = kwargs['gt_parsings']
+        gt_parse_labels = kwargs['gt_parse_labels']
+        mask_parts = kwargs.get('mask_parts', None)
+        if mask_parts is not None and mask_parts[0] == 1000:
+            mask_parts = None
+
+        loss_dict = dict()
+        # semantic parsing loss
+        start = int(self.parse_logit_stride // 2)
+        gt_semantic_seg = gt_semantic_seg[:, :, start::self.parse_logit_stride,\
+            start::self.parse_logit_stride]
+        bs = gt_semantic_seg.shape[0]
+        loss_seg = self.loss_seg(seg_logits[:bs], gt_semantic_seg.squeeze(1).long())
+        loss_dict['loss_seg'] = loss_seg
+
+        # DETR loss supervision at all dec layers
+        num_dec_layers = len(all_cls_scores)
+        all_gt_bboxes_list = [gt_bboxes for _ in range(num_dec_layers)]
+        all_gt_labels_list = [gt_labels for _ in range(num_dec_layers)]
+        all_gt_parsings_list = [gt_parsings for _ in range(num_dec_layers)]
+        all_gt_parse_labels_list = [gt_parse_labels for _ in range(num_dec_layers)]
+        all_img_metas_list = [img_metas for _ in range(num_dec_layers)]
+        all_num_layer_list = [i for i in range(num_dec_layers)]
+
+        losses_cls, losses_bbox, losses_iou,\
+        losses_part_cls, losses_mask, losses_dice, \
+        losses_cxt_mask, losses_cxt_dice, losses_factor =\
+            multi_apply(
+            self.loss_single, all_cls_scores, all_bbox_preds,
+            all_params, all_p_cls_scores, all_gt_bboxes_list,
+            all_gt_labels_list, all_gt_parsings_list,
+            all_gt_parse_labels_list, all_img_metas_list,
+            all_num_layer_list, parse_feats=parse_feats,
+            mask_parts=mask_parts)
+
+        # loss from the last decoder layer
+        loss_dict['loss_cls'] = losses_cls[-1]
+        loss_dict['loss_bbox'] = losses_bbox[-1]
+        loss_dict['loss_iou'] = losses_iou[-1]
+        loss_dict['loss_part_cls'] = losses_part_cls[-1]
+        loss_dict['loss_mask'] = losses_mask[-1]
+        loss_dict['loss_dice'] = losses_dice[-1]
+        loss_dict['loss_cxt_mask'] = losses_cxt_mask[-1]
+        loss_dict['loss_cxt_dice'] = losses_cxt_dice[-1]
+        if isinstance(losses_factor[-1], torch.Tensor):
+            loss_dict['loss_factor'] = losses_factor[-1]
+
+        # loss from other decoder layers
+        num_dec_layer = 0
+        for loss_cls_i, loss_bbox_i,\
+            loss_iou_i, losses_mask_i,\
+            losses_part_cls_i,loss_dice_i\
+                             in zip(losses_cls[:-1],
+                                    losses_bbox[:-1],
+                                    losses_iou[:-1],
+                                    losses_mask[:-1],
+                                    losses_part_cls[:-1],
+                                    losses_dice[:-1]):
+            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
+            loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i
+            loss_dict[f'd{num_dec_layer}.loss_part_cls'] = losses_part_cls_i
+            loss_dict[f'd{num_dec_layer}.loss_mask'] = losses_mask_i
+            loss_dict[f'd{num_dec_layer}.loss_dice'] = loss_dice_i
+            num_dec_layer += 1 
+        
+        return loss_dict
 
     def loss_single(self,
                     cls_scores,
@@ -121,9 +188,120 @@ class CausalParserHead(DeformableDETRParserHead):
                     img_metas,
                     num_layer,
                     parse_feats,
+                    mask_parts,
                     gt_bboxes_ignore_list=None):
 
-        pass
+        num_imgs = len(gt_bboxes_list)
+        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
+        bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
+        params_list = [params[i] for i in range(num_imgs)]
+        p_cls_scores_list = [p_cls_scores[i] for i in range(num_imgs)]
+
+        cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
+                                           params_list, p_cls_scores_list,
+                                           gt_bboxes_list, gt_labels_list,
+                                           gt_parsings_list, gt_parsings_labels_list,
+                                           img_metas, gt_bboxes_ignore_list)
+        (labels_list, label_weights_list, bbox_targets_list,
+         bbox_weights_list, num_total_pos, num_total_neg,
+         pos_params_list, parsing_targets_list,
+         pos_p_scores_list, parsing_labels_targets_list,
+         pos_inds_list) = cls_reg_targets
+
+        labels = torch.cat(labels_list, 0)
+        label_weights = torch.cat(label_weights_list, 0)
+        bbox_targets = torch.cat(bbox_targets_list, 0)
+        bbox_weights = torch.cat(bbox_weights_list, 0)
+
+        # classification loss
+        cls_scores = cls_scores[:num_imgs].reshape(-1, self.cls_out_channels)
+        # construct weighted avg_factor to match with the official DETR repo
+        cls_avg_factor = num_total_pos * 1.0 + \
+            num_total_neg * self.bg_cls_weight
+        if self.sync_cls_avg_factor:
+            cls_avg_factor = reduce_mean(
+                cls_scores.new_tensor([cls_avg_factor]))
+        cls_avg_factor = max(cls_avg_factor, 1)
+
+        loss_cls = self.loss_cls(
+            cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+
+        # Compute the average number of gt boxes across all gpus, for
+        # normalization purposes
+        num_total_pos = loss_cls.new_tensor([num_total_pos])
+        num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+
+        # construct factors used for rescale bboxes
+        bbox_preds = bbox_preds[:num_imgs]
+        factors = []
+        for img_meta, bbox_pred in zip(img_metas, bbox_preds):
+            img_h, img_w, _ = img_meta['img_shape']
+            factor = bbox_pred.new_tensor([img_w, img_h, img_w,
+                                           img_h]).unsqueeze(0).repeat(
+                                               bbox_pred.size(0), 1)
+            factors.append(factor)
+        factors = torch.cat(factors, 0)
+
+        # DETR regress the relative position of boxes (cxcywh) in the image,
+        # thus the learning target is normalized by the image size. So here
+        # we need to re-scale them for calculating IoU loss
+        bbox_preds = bbox_preds.reshape(-1, 4)
+        bboxes = bbox_cxcywh_to_xyxy(bbox_preds) * factors
+        bboxes_gt = bbox_cxcywh_to_xyxy(bbox_targets) * factors
+
+        # regression IoU loss, defaultly GIoU loss
+        loss_iou = self.loss_iou(
+            bboxes, bboxes_gt, bbox_weights, avg_factor=num_total_pos)
+
+        # regression L1 loss
+        loss_bbox = self.loss_bbox(
+            bbox_preds, bbox_targets, bbox_weights, avg_factor=num_total_pos)
+        
+        # parsing labels loss
+        pos_parsing_scores = torch.cat(pos_p_scores_list, 0)
+        parsing_labels_targets = torch.cat(parsing_labels_targets_list, 0)
+        valid_mask = parsing_labels_targets.sum(dim=-1).bool()
+        num_pos = valid_mask.sum()
+        if num_pos == 0:
+            loss_part_cls = pos_parsing_scores.sum() * 0.
+        else:
+            loss_part_cls = self.loss_part_cls(
+                pos_parsing_scores[valid_mask],
+                parsing_labels_targets[valid_mask])
+
+        # parsing forward
+        with torch.no_grad():
+            pos_inds = bbox_weights.max(1)[0].bool()
+            centers = ((bboxes[:, 0] + bboxes[:, 2])/2, (bboxes[:, 1] + bboxes[:, 3])/2)
+            centers = torch.stack(centers, 1)
+            centers = centers[pos_inds]
+        if num_layer == (self.dec_num_layer - 1):
+            if self.use_aug:
+                aug_parasm = params[num_imgs:]
+                for i, pos_inds in enumerate(pos_inds_list):
+                    pos_params_list.append(aug_parasm[i][pos_inds])
+
+                parsing_labels_targets = parsing_labels_targets[None, ...].repeat(2, 1, 1).reshape(-1, self.num_parse_classes-1)
+                if mask_parts is not None:
+                    parsing_labels_targets[num_pos:, mask_parts] = 0
+
+                centers = centers[None, ...].repeat(2, 1, 1).reshape(-1, 2)
+
+            cnt_pred, cxt_pred, cnt_feats, cxt_feats = self.casual_head_forward(
+                pos_params_list, parse_feats, parsing_labels_targets, centers)
+            loss_mask, loss_dice, loss_cxt_mask, loss_cxt_dice, loss_factor = \
+                self.loss_causal_forward(
+                cnt_pred, cxt_pred, cnt_feats,
+                cxt_feats, parsing_targets_list,
+                mask_parts, img_metas)
+        else:
+            parsing_pred = self.parsing_head_forward(pos_params_list, parse_feats[:num_imgs], centers)
+            loss_mask, loss_dice = self.loss_parsing_forward(
+                parsing_pred, parsing_targets_list, img_metas)
+            loss_cxt_mask = loss_cxt_dice = loss_factor = 0.
+
+        return loss_cls, loss_bbox, loss_iou, loss_part_cls, \
+               loss_mask, loss_dice, loss_cxt_mask, loss_cxt_dice, loss_factor
 
     def get_targets(self,
                     cls_scores_list,
@@ -137,7 +315,27 @@ class CausalParserHead(DeformableDETRParserHead):
                     img_metas,
                     gt_bboxes_ignore_list=None):
 
-        pass
+        assert gt_bboxes_ignore_list is None, \
+            'Only supports for gt_bboxes_ignore setting to None.'
+        num_imgs = len(cls_scores_list)
+        gt_bboxes_ignore_list = [
+            gt_bboxes_ignore_list for _ in range(num_imgs)
+        ]
+
+        (labels_list, label_weights_list, bbox_targets_list,
+         bbox_weights_list, pos_inds_list, neg_inds_list,
+         pos_params_list, parsing_targets_list,
+         pos_p_scores_list, parsing_labels_targets_list) = multi_apply(
+             self._get_target_single, cls_scores_list, bbox_preds_list,
+             params_list, p_cls_scores_list, gt_bboxes_list, gt_labels_list,
+             gt_parsings_list, gt_parsings_labels_list,
+             img_metas, gt_bboxes_ignore_list)
+        num_total_pos = sum((inds.numel() for inds in pos_inds_list))
+        num_total_neg = sum((inds.numel() for inds in neg_inds_list))
+        return (labels_list, label_weights_list, bbox_targets_list,
+                bbox_weights_list, num_total_pos, num_total_neg,
+                pos_params_list, parsing_targets_list, pos_p_scores_list,
+                parsing_labels_targets_list, pos_inds_list)
 
     def casual_head_forward(self, pos_params_list, parse_feats, parse_labels, centers=None):
 
@@ -153,7 +351,9 @@ class CausalParserHead(DeformableDETRParserHead):
 
         if self.use_rel_coord:
             rel_coords = relative_coordinate_maps(
-                parse_feats.shape, centers, self.parse_feat_stride, range=self.parse_range)
+                parse_feats.shape, centers, self.parse_feat_stride,
+                stride=self.parse_feat_stride,
+                range=self.parse_range)
             parse_feats = torch.cat([
                 rel_coords.view(-1, 2, H, W),
                 parse_feats.reshape(-1, D, H, W)], dim=1)
@@ -247,6 +447,7 @@ class CausalParserHead(DeformableDETRParserHead):
                             cnt_feats,
                             cxt_feats,
                             parsing_targets_list,
+                            mask_parts,
                             img_metas):        
         # parsing targets
         start = int(self.parse_logit_stride // 2)
@@ -315,32 +516,38 @@ class CausalParserHead(DeformableDETRParserHead):
             parsing_cnt_masks = parsing_cnt_masks[:,1:C,:,:]
 
             valid_inds = parsing_cnt_masks.reshape(B, C-1, -1).sum(-1) > 0
-            v_parsing_cnt_masks = parsing_cnt_masks[valid_inds]
-            v_parsing_cxt_masks = parsing_cxt_masks[valid_inds]
+            if mask_parts is not None:
+                valid_inds[:, mask_parts] = False
+            
+            if valid_inds.sum() == 0:
+                factor_loss = parsing_cnt_masks.sum() * 0.
+            else:
+                v_parsing_cnt_masks = parsing_cnt_masks[valid_inds]
+                v_parsing_cxt_masks = parsing_cxt_masks[valid_inds]
 
-            # repeat for aug img
-            valid_inds = valid_inds[None, ...].repeat(2, 1, 1).reshape(-1, C-1)
-            v_parsing_cnt_masks = v_parsing_cnt_masks[None, ...].repeat(2, 1, 1, 1).reshape(-1, H, W)
-            v_parsing_cxt_masks = v_parsing_cxt_masks[None, ...].repeat(2, 1, 1, 1).reshape(-1, H, W)
+                # repeat for aug img
+                valid_inds = valid_inds[None, ...].repeat(2, 1, 1).reshape(-1, C-1)
+                v_parsing_cnt_masks = v_parsing_cnt_masks[None, ...].repeat(2, 1, 1, 1).reshape(-1, H, W)
+                v_parsing_cxt_masks = v_parsing_cxt_masks[None, ...].repeat(2, 1, 1, 1).reshape(-1, H, W)
 
-            cnt_feats = cnt_feats[valid_inds] * v_parsing_cnt_masks.unsqueeze(1)
-            cxt_feats = cxt_feats[valid_inds] * v_parsing_cxt_masks.unsqueeze(1)
+                cnt_feats = cnt_feats[valid_inds] * v_parsing_cnt_masks.unsqueeze(1)
+                cxt_feats = cxt_feats[valid_inds] * v_parsing_cxt_masks.unsqueeze(1)
 
-            cnt_avg_feats = self.avg_pooler(cnt_feats).squeeze()
-            cxt_avg_feats = self.avg_pooler(cxt_feats).squeeze()
-            N, _ = cnt_avg_feats.shape
-            cnt_avg_feats, aug_cnt_avg_feats = cnt_avg_feats.split(N//2, dim=0)
-            cxt_avg_feats, aug_cxt_avg_feats = cxt_avg_feats.split(N//2, dim=0)
+                cnt_avg_feats = self.avg_pooler(cnt_feats).squeeze()
+                cxt_avg_feats = self.avg_pooler(cxt_feats).squeeze()
+                N, _ = cnt_avg_feats.shape
+                cnt_avg_feats, aug_cnt_avg_feats = cnt_avg_feats.split(N//2, dim=0)
+                cxt_avg_feats, aug_cxt_avg_feats = cxt_avg_feats.split(N//2, dim=0)
 
-            ori_feats = torch.stack((cnt_avg_feats, cxt_avg_feats), dim=1)
-            ori_feats = F.normalize(ori_feats, p=2, dim=-1)
-            aug_feats = torch.stack((aug_cnt_avg_feats, aug_cxt_avg_feats), dim=1)
-            aug_feats = F.normalize(aug_feats, p=2, dim=-1)
+                ori_feats = torch.stack((cnt_avg_feats, cxt_avg_feats), dim=1)
+                ori_feats = F.normalize(ori_feats, p=2, dim=-1)
+                aug_feats = torch.stack((aug_cnt_avg_feats, aug_cxt_avg_feats), dim=1)
+                aug_feats = F.normalize(aug_feats, p=2, dim=-1)
 
-            cor = torch.bmm(ori_feats, aug_feats.permute(0, 2, 1))
-            on_diag = torch.diagonal(cor, dim1=1, dim2=2).add_(-1).pow_(2).mean()
-            off_diag = cor.flatten(1)[:, :-1].view(-1, 1, 3)[:, :, 1:].flatten().pow_(2).mean()
-            factor_loss = (on_diag + off_diag) * 5
+                cor = torch.bmm(ori_feats, aug_feats.permute(0, 2, 1))
+                on_diag = torch.diagonal(cor, dim1=1, dim2=2).add_(-1).pow_(2).mean()
+                off_diag = cor.flatten(1)[:, :-1].view(-1, 1, 3)[:, :, 1:].flatten().pow_(2).mean()
+                factor_loss = (on_diag + off_diag) * 5
         else:
             factor_loss = 0.
 

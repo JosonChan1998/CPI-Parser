@@ -266,6 +266,10 @@ class DefaultFormatBundle:
             results['gt_parse_labels'] = DC(to_tensor(results['gt_parse_labels']))
         if 'gt_parse_points' in results:
             results['gt_parse_points'] = DC(to_tensor(results['gt_parse_points']))
+        if 'mask_part' in results:
+            results['mask_part'] = DC(to_tensor(results['mask_part']))
+        if 'gt_attributes' in results.keys():
+            results['gt_attributes'] = DC(to_tensor(results['gt_attributes']))
         return results
 
     def _add_default_meta_keys(self, results):

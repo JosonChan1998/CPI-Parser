@@ -122,6 +122,3 @@ work_dirs/
 *.pth
 *.py~
 *.sh~
-
-# utils
-utils/

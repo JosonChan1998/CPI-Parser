@@ -1,6 +1,6 @@
-# COSParser
+# CPI-Parser
 
-Official implementation of **COSParser**. It based on [mmdetection](https://mmdetection.readthedocs.io/en/latest/get_started.html#installation).
+Official implementation of **CPI-Parser**. It based on [mmdetection](https://mmdetection.readthedocs.io/en/latest/get_started.html#installation).
 
 ## Installation
 - pytorch 1.10.0 
@@ -63,5 +63,7 @@ python utils/eval.py
 ```
 
 ## Training
-
-Coming soon...
+```
+# training
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./tools/dist_train.sh configs/COSParser/causal_parser_r50_inter_8_135k_cihp.py 8
+```
